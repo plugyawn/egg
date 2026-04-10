@@ -1,31 +1,76 @@
-# egg
+# egg 🥚
 
-TODO(b/500685132): Add a description for your new project, explain what is
-being released here, etc... Additional, the following sections are normally
-expected for all releases. Feel free to add additional sections if appropriate
-for your project.
+A minimal, CPU-friendly simulation environment for exploring RL on LLMs — before
+they hatch into full-scale distributed training.
+
+<a href="egg_logo.png" target="_blank">
+  <img src="egg_logo.png" width="300"/>
+</a>
+
+## Goals
+
+-   **Tiny + Transparent**: No big framework, no magic.
+-   **Algorithm-first**: Code should resemble paper pseudocode.
+-   **Rapid iteration**: Launch and test ideas in seconds.
+-   **Insightful**: Concepts here should transfer to larger scale.
 
 ## Installation
 
-Write instructions for how the user should install your code. The instructions
-should ideally be valid when copy-pasted. You can combine this with the Usage
-section if there's no separate installation step.
+`egg` can be installed using `pip`. We recommend using a virtual environment:
+
+```bash
+python3 -m venv egg_venv
+source egg_venv/bin/activate
+pip install --upgrade pip
+pip install .
+```
+
+To run tests, you can install the test dependencies:
+
+```bash
+pip install .[test]
+pytest
+```
 
 ## Usage
 
-Write example usage of your code. The instructions should ideally be valid when
-copy-pasted, and will be used by your technical reviewer to verify that your
-package functions correctly.
+You can run the baseline experiment with the following command:
+
+```bash
+python3 experiments/baseline/run.py --sweep.num_steps=10
+```
 
 ## Citing this work
 
 Add citation details here, usually a pastable BibTeX snippet:
 
 ```
-@article{publicationname,
-      title={Publication Name},
-      author={Author One and Author Two and Author Three},
+@misc{osband2026delightfulpolicygradient,
+      title={Delightful Policy Gradient},
+      author={Ian Osband},
       year={2026},
+      eprint={2603.14608},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.14608},
+}
+@misc{osband2026delightfuldistributedpolicygradient,
+      title={Delightful Distributed Policy Gradient},
+      author={Ian Osband},
+      year={2026},
+      eprint={2603.20521},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.20521},
+}
+@misc{osband2026doesgradientsparkjoy,
+      title={Does This Gradient Spark Joy?},
+      author={Ian Osband},
+      year={2026},
+      eprint={2603.20526},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.20526},
 }
 ```
 
