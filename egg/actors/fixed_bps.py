@@ -85,7 +85,11 @@ class FixedBPSActor(base.Actor[base.StateT]):
       sampler_apply_fn = state.apply_fn
 
     seqs, logps = self.sampler(
-        sampler_apply_fn, state.params, prompts_flat, k_sample
+        sampler_apply_fn,
+        state.params,
+        prompts_flat,
+        k_sample,
+        model=self.sampler_network,
     )
     answers = seqs[:, prompt_len:]  # (B, A_len)
 

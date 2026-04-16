@@ -113,7 +113,11 @@ class DreamerActor(base.Actor[base.StateT]):
         self.sampler_network.apply if self.sampler_network else state.apply_fn
     )
     seqs, logps_full = self.sampler(
-        sampler_apply_fn, state.params, prompts_flat, k_sample
+        sampler_apply_fn,
+        state.params,
+        prompts_flat,
+        k_sample,
+        model=self.sampler_network,
     )
 
     # Answer length.

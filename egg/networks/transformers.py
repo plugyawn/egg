@@ -69,11 +69,42 @@ class Transformer(nn.Module):
 
     return output_layer(x)  # (B, T, V)
 
+  @nn.compact
+  def decode_step(self, tokens: jax.Array, **kwargs) -> jax.Array:
+    """Single-token cached decode step for autoregressive sampling."""
+    del kwargs  # Unused.
+
+    if tokens.ndim != 2 or tokens.shape[1] != 1:
+      raise ValueError(
+          "decode_step expects tokens with shape (batch_size, 1)."
+      )
+
+    cache_index = self.variable(
+        "cache",
+        "position",
+        lambda: jnp.array(0, dtype=jnp.int32),
+    )
+    x = _embed_decode(tokens, self.config, cache_index.value)
+    cache_index.value = cache_index.value + tokens.shape[1]
+
+    for i in range(self.config.num_layers):
+      x = TransformerBlock(
+          self.config,
+          decode=True,
+          name=f"layer_{i}",
+      )(x, mask=None)
+
+    output_layer = nn.Dense(
+        self.config.vocab_size, use_bias=self.config.bias, name="output"
+    )
+    return output_layer(x)  # (B, 1, V)
+
 
 class TransformerBlock(nn.Module):
   """Single transformer block: pre-norm attention + feed-forward."""
 
   config: NetworkConfig
+  decode: bool = False
 
   @nn.compact
   def __call__(self, x: jax.Array, mask: jax.Array) -> jax.Array:
@@ -82,6 +113,7 @@ class TransformerBlock(nn.Module):
     h = nn.MultiHeadDotProductAttention(
         num_heads=self.config.num_heads,
         use_bias=self.config.bias,
+        decode=self.decode,
         name="self_attn",
     )(inputs_q=h, inputs_k=h, inputs_v=h, mask=mask)
     x = x + h  # Residual
@@ -127,3 +159,21 @@ def _embed(
 
   x = (tok_emb + pos_emb) * pad_mask  # zero-out PAD rows
   return x, pad_mask
+
+
+def _embed_decode(
+    tokens: jax.Array,
+    cfg: NetworkConfig,
+    start_position: jax.Array,
+) -> jax.Array:
+  """Embed one decode chunk at its absolute position."""
+  pad_mask = (tokens != base.PAD_TOKEN)[..., None]  # (B, 1, 1)
+
+  safe_ids = jnp.where(tokens == base.PAD_TOKEN, 0, tokens)
+  tok_emb = nn.Embed(cfg.vocab_size, cfg.embed_dim, name="token_emb")(safe_ids)
+
+  pos_idx = start_position + jnp.arange(tokens.shape[1], dtype=jnp.int32)
+  pos_emb = nn.Embed(cfg.sequence_length, cfg.embed_dim, name="pos_emb")(pos_idx)
+  pos_emb = jnp.expand_dims(pos_emb, 0)  # (1, 1, D)
+
+  return (tok_emb + pos_emb) * pad_mask

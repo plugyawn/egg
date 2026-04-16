@@ -121,6 +121,7 @@ class FixedBPCActor(base.Actor[base.StateT]):
             params=state.params,
             prompts=prompts,
             key=k,
+            model=self.sampler_network,
         )
 
       seqs, logps = jax.vmap(_sample)(active_prompts, sample_keys)
