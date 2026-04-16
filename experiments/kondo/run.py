@@ -21,7 +21,8 @@ Reproduces the experiments from the costly paper (§5):
 
 Losses:
   delightful: DG with sigmoid gate (no backward-pass savings).
-  kondo: DG-K with binary Kondo gate (skips backward passes).
+  kondo: base token-mask Kondo, or proper Kondo compute skipping when
+    `proper_kondo=True`.
   reinforce: PG baseline.
   ppo, pmpo: standard RL baselines.
 """
@@ -41,8 +42,10 @@ from egg.lib import logging
 from egg.losses import catalog
 from egg.losses import dg
 from egg.losses import kondo
+from egg.losses import screened_pg
 from egg.networks import logit_noise
 from egg.networks import transformers
+from egg.trainers import kondo_async
 from egg.trainers import vanilla_async
 import fancyflags as ff
 import jax.numpy as jnp
@@ -82,18 +85,23 @@ class SweepConfig:
   # 'delight', 'advantage', 'abs_advantage', 'surprisal', 'uniform', 'additive'
   priority: str = 'delight'
   alpha_additive: float = 0.5  # Only used if priority = additive
+  proper_kondo: bool = True  # Use compacted-batch compute skipping.
 
   learning_rate: float = 3e-4
   seed: int = 42
   num_steps: int = 1000
+  log_freq: int | None = None
   prompts_per_batch: int = 10
   samples_per_prompt: int = 10
   log_details: bool = False
 
 
-SweepFlags = ff.DEFINE_from_instance(
-    'sweep', SweepConfig(), 'Sweep configuration.'
-)
+if hasattr(ff, 'DEFINE_from_instance'):
+  SweepFlags = ff.DEFINE_from_instance(
+      'sweep', SweepConfig(), 'Sweep configuration.'
+  )
+else:
+  SweepFlags = ff.DEFINE_auto('sweep', SweepConfig, 'Sweep configuration.')
 
 
 def run_experiment(sweep_config: SweepConfig) -> pd.DataFrame:
@@ -161,14 +169,19 @@ def run_experiment(sweep_config: SweepConfig) -> pd.DataFrame:
         num_groups=sweep_config.prompts_per_batch,
     )
   elif sweep_config.loss == 'kondo':
-    loss_cfg = kondo.LossConfig(
-        pct_learn=sweep_config.loss_param_one,
-        priority=sweep_config.priority,
-        alpha_additive=sweep_config.alpha_additive,
-        beta_kl=sweep_config.loss_param_two,
-        use_grouped_baseline=True,
-        num_groups=sweep_config.prompts_per_batch,
-    )
+    if sweep_config.proper_kondo:
+      loss_cfg = screened_pg.LossConfig(
+          beta_kl=sweep_config.loss_param_two,
+      )
+    else:
+      loss_cfg = kondo.LossConfig(
+          pct_learn=sweep_config.loss_param_one,
+          priority=sweep_config.priority,
+          alpha_additive=sweep_config.alpha_additive,
+          beta_kl=sweep_config.loss_param_two,
+          use_grouped_baseline=True,
+          num_groups=sweep_config.prompts_per_batch,
+      )
   elif sweep_config.loss == 'ppo':
     loss_cfg = catalog.Loss.PPO.config(
         clip_epsilon=sweep_config.loss_param_one,
@@ -200,11 +213,25 @@ def run_experiment(sweep_config: SweepConfig) -> pd.DataFrame:
       learning_rate=sweep_config.learning_rate,
   )
 
-  trainer_cfg = vanilla_async.TrainerConfig(
-      steps=sweep_config.num_steps,
-      seed=sweep_config.seed,
-      log_details=sweep_config.log_details,
-  )
+  if sweep_config.loss == 'kondo' and sweep_config.proper_kondo:
+    trainer_cfg = kondo_async.TrainerConfig(
+        steps=sweep_config.num_steps,
+        seed=sweep_config.seed,
+        log_freq=sweep_config.log_freq,
+        log_details=sweep_config.log_details,
+        pct_learn=sweep_config.loss_param_one,
+        priority=sweep_config.priority,
+        alpha_additive=sweep_config.alpha_additive,
+        use_grouped_baseline=True,
+        num_groups=sweep_config.prompts_per_batch,
+    )
+  else:
+    trainer_cfg = vanilla_async.TrainerConfig(
+        steps=sweep_config.num_steps,
+        seed=sweep_config.seed,
+        log_freq=sweep_config.log_freq,
+        log_details=sweep_config.log_details,
+    )
 
   actor = actor_cfg.make()
   learner = learner_cfg.make()

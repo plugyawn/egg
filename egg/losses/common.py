@@ -34,6 +34,19 @@ class PolicyLogProbs:
   row_mask: jax.Array  # (B,) — valid rows
 
 
+@dataclasses.dataclass(frozen=True)
+class DelightSignals:
+  """Learner-side screening signals used by DG and proper Kondo."""
+
+  fwd: PolicyLogProbs
+  sampler_lp_answer: jax.Array  # (B, A)
+  advantages: jax.Array  # (B,)
+  surprisal_tok: jax.Array  # (B, A)
+  delight_tok: jax.Array  # (B, A)
+  priority_tok: jax.Array  # (B, A)
+  priority_row: jax.Array  # (B,)
+
+
 def forward_pass(
     params: base.Params,
     state: base.StateT,
@@ -92,3 +105,120 @@ def grouped_advantages(
   cnt_r = jnp.zeros(num_groups, jnp.float32).at[group_ids].add(row_mask)
   baseline_per_group = sum_r / (cnt_r + eps)
   return rewards - jax.lax.stop_gradient(baseline_per_group[group_ids])
+
+
+def compute_priority(
+    priority: str,
+    advantage: jax.Array,
+    surprisal_tok: jax.Array,
+    alpha: float = 0.5,
+) -> jax.Array:
+  """Per-token Kondo priority score."""
+  if priority == "delight":
+    return advantage[:, None] * surprisal_tok
+  elif priority == "advantage":
+    return jnp.broadcast_to(advantage[:, None], surprisal_tok.shape)
+  elif priority == "abs_advantage":
+    return jnp.broadcast_to(jnp.abs(advantage[:, None]), surprisal_tok.shape)
+  elif priority == "surprisal":
+    return surprisal_tok
+  elif priority == "uniform":
+    return jnp.ones_like(surprisal_tok)
+  elif priority == "additive":
+    return alpha * advantage[:, None] + (1.0 - alpha) * surprisal_tok
+  else:
+    raise ValueError(f"Unknown priority: {priority}")
+
+
+def topk_token_gate(
+    priority_tok: jax.Array,
+    token_mask: jax.Array,
+    pct_learn: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Binary top-k token gate matching the dense Kondo masking rule."""
+  total_valid_tokens = jnp.sum(token_mask)
+  k_target = jnp.maximum(
+      1, jnp.round(jnp.asarray(pct_learn, jnp.float32) * total_valid_tokens).astype(jnp.int32)
+  )
+  vals_flat = jnp.where(token_mask > 0.0, priority_tok, -jnp.inf).reshape(-1)
+  sorted_vals = jnp.sort(vals_flat)
+  threshold = sorted_vals[vals_flat.size - k_target] - 1e-6
+  gate = (priority_tok >= threshold).astype(jnp.float32) * token_mask
+  return gate, threshold, k_target
+
+
+def delight_signals(
+    params: base.Params,
+    state: base.StateT,
+    batch: base.Batch,
+    key: jax.Array,
+    *,
+    use_grouped_baseline: bool,
+    num_groups: int | None,
+    priority: str = "delight",
+    alpha_additive: float = 0.5,
+) -> DelightSignals:
+  """Computes learner-side delight and row-level screening scores."""
+  fwd = forward_pass(params, state, batch, key)
+  sampler_lp_answer = sampler_answer_logprobs(batch)
+  rewards = batch.rewards
+
+  if use_grouped_baseline:
+    group_ids = batch.aux.get("group_ids")
+    advantages = grouped_advantages(
+        rewards,
+        group_ids,
+        num_groups,
+        fwd.row_mask,
+    )
+  else:
+    advantages = rewards
+
+  surprisal_tok = -fwd.lp_answer
+  delight_tok = advantages[:, None] * surprisal_tok
+  priority_tok = compute_priority(
+      priority,
+      advantages,
+      surprisal_tok,
+      alpha=alpha_additive,
+  )
+
+  tok_count_per_row = jnp.sum(fwd.token_mask, axis=1)
+  safe_tok_count = tok_count_per_row + 1e-8
+  priority_row = (
+      jnp.sum(priority_tok * fwd.token_mask, axis=1) / safe_tok_count
+  ) * fwd.row_mask
+
+  return DelightSignals(
+      fwd=fwd,
+      sampler_lp_answer=sampler_lp_answer,
+      advantages=advantages,
+      surprisal_tok=surprisal_tok,
+      delight_tok=delight_tok,
+      priority_tok=priority_tok,
+      priority_row=priority_row,
+  )
+
+
+def compact_batch_rows(batch: base.Batch, row_indices: jax.Array) -> base.Batch:
+  """Selects a fixed subset of rows from a batch and row-shaped aux fields."""
+  prompts = jnp.take(batch.prompts, row_indices, axis=0)
+  answers = jnp.take(batch.answers, row_indices, axis=0)
+  rewards = jnp.take(batch.rewards, row_indices, axis=0)
+  sample_log_probs = jnp.take(batch.sample_log_probs, row_indices, axis=0)
+
+  aux: dict[str, jax.Array] = {}
+  batch_rows = batch.prompts.shape[0]
+  for key, value in batch.aux.items():
+    if hasattr(value, "shape") and value.shape and value.shape[0] == batch_rows:
+      aux[key] = jnp.take(value, row_indices, axis=0)
+    else:
+      aux[key] = value
+
+  return base.Batch(
+      prompts=prompts,
+      answers=answers,
+      rewards=rewards,
+      sample_log_probs=sample_log_probs,
+      aux=aux,
+  )

@@ -32,6 +32,10 @@ import jax
 import pandas as pd
 
 
+def _block_tree(tree):
+  return jax.tree_util.tree_map(jax.block_until_ready, tree)
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig(base.MakeableConfig["VanillaAsyncTrainer"]):
   """Configuration for the vanilla async trainer."""
@@ -83,30 +87,22 @@ class VanillaAsyncTrainer(base.Trainer):
     params_history: tuple[tp.Any, ...] = tuple([state.params] * hist_len)
 
     @jax.jit
-    def train_step(
+    def sample_batch_step(
         current_state: base.StateT,
         actor_params: tp.Any,
         key: jax.Array,
-    ) -> tuple[base.StateT, jax.Array, base.Metrics]:
-      # Actor: sample a batch using provided actor_params
-      key, sample_key = jax.random.split(key)
+    ) -> tuple[base.Batch, base.Metrics]:
       actor_state = current_state.replace(params=actor_params)
-      batch, _, actor_metrics = actor.sample_batch(actor_state, sample_key)
+      batch, _, actor_metrics = actor.sample_batch(actor_state, key)
+      return batch, actor_metrics
 
-      # Learner: compute grads + update state
-      key, grad_key = jax.random.split(key)
-      new_state, learner_metrics = learner.step(current_state, batch, grad_key)
-
-      # Conditional metric logging based on log_details
-      metrics: base.Metrics = {
-          "reward": batch.rewards.mean(),
-      }
-      if self.config.log_details:
-        metrics.update({
-            **{f"actor/{k}": v for k, v in actor_metrics.items()},
-            **{f"learner/{k}": v for k, v in learner_metrics.items()},
-        })
-      return new_state, key, metrics
+    @jax.jit
+    def train_on_batch_step(
+        current_state: base.StateT,
+        batch: base.Batch,
+        key: jax.Array,
+    ) -> tuple[base.StateT, base.Metrics]:
+      return learner.step(current_state, batch, key)
 
     @jax.jit
     def evaluate_learner_performance(
@@ -117,6 +113,15 @@ class VanillaAsyncTrainer(base.Trainer):
       batch, _, _ = actor.sample_batch(current_state, key)
       return batch.rewards.mean()
 
+    key, warm_quant_key, warm_sample_key, warm_train_key = jax.random.split(
+        key, 4
+    )
+    warm_actor_params = quantizer(state.params, warm_quant_key)
+    warm_batch, _ = sample_batch_step(state, warm_actor_params, warm_sample_key)
+    warm_state, _ = train_on_batch_step(state, warm_batch, warm_train_key)
+    _block_tree(warm_batch.prompts)
+    _block_tree(warm_state.params)
+
     records: list[dict[str, tp.Any]] = []
     start = time.time()
     cumulative_reward = 0.0
@@ -124,7 +129,9 @@ class VanillaAsyncTrainer(base.Trainer):
 
     for step in range(1, self.config.steps + 1):
       # RNG for: (quantization, training step, evaluation)
-      key, quant_key, train_key, eval_key = jax.random.split(key, 4)
+      key, quant_key, sample_key, train_key, eval_key = jax.random.split(
+          key, 5
+      )
 
       # Choose which snapshot the actor will see this step.
       # Fixed worst-case delay 0=oldest. Uniform delay sample in [0, hist_len].
@@ -141,8 +148,27 @@ class VanillaAsyncTrainer(base.Trainer):
       # Quantize the chosen params for the actor.
       actor_params = quantizer(chosen_params, quant_key)
 
-      # Run one training step
-      state, key, metrics = train_step(state, actor_params, train_key)
+      sample_t0 = time.perf_counter()
+      batch, actor_metrics = sample_batch_step(state, actor_params, sample_key)
+      _block_tree(batch.prompts)
+      sample_time_s = time.perf_counter() - sample_t0
+
+      train_t0 = time.perf_counter()
+      state, learner_metrics = train_on_batch_step(state, batch, train_key)
+      _block_tree(state.params)
+      train_time_s = time.perf_counter() - train_t0
+
+      metrics: base.Metrics = {
+          "reward": batch.rewards.mean(),
+          "sample_time_s": sample_time_s,
+          "train_time_s": train_time_s,
+          "total_step_time_s": sample_time_s + train_time_s,
+      }
+      if self.config.log_details:
+        metrics.update({
+            **{f"actor/{k}": v for k, v in actor_metrics.items()},
+            **{f"learner/{k}": v for k, v in learner_metrics.items()},
+        })
 
       # Update history with the new parameters (drop oldest, append newest)
       params_history = params_history[1:] + (state.params,)

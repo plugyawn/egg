@@ -29,6 +29,7 @@ import enum
 from absl import logging
 from egg import base
 from egg.lib import statistics
+from egg.losses import common
 import jax
 import jax.numpy as jnp
 
@@ -70,31 +71,6 @@ class LossConfig(base.MakeableConfig[base.LossFn]):
         priority=PriorityType(self.priority),
         alpha_additive=float(self.alpha_additive),
     )
-
-
-def _compute_priority(
-    priority: PriorityType,
-    advantage: jnp.ndarray,
-    surprisal_tok: jnp.ndarray,
-    token_mask: jnp.ndarray,  # pylint: disable=unused-argument
-    alpha: float,
-) -> jnp.ndarray:
-  """Per-token priority score, shape (B, A)."""
-  if priority == PriorityType.DELIGHT:
-    return advantage[:, None] * surprisal_tok
-  elif priority == PriorityType.ADVANTAGE:
-    return jnp.broadcast_to(advantage[:, None], surprisal_tok.shape)
-  elif priority == PriorityType.ABS_ADVANTAGE:
-    return jnp.broadcast_to(jnp.abs(advantage[:, None]), surprisal_tok.shape)
-  elif priority == PriorityType.SURPRISAL:
-    return surprisal_tok
-  elif priority == PriorityType.UNIFORM:
-    return jnp.ones_like(surprisal_tok)
-  elif priority == PriorityType.ADDITIVE:
-    return alpha * advantage[:, None] + (1.0 - alpha) * surprisal_tok
-  else:
-    raise ValueError(f'Unknown priority: {priority}')
-
 
 @dataclasses.dataclass(frozen=True)
 class KondoLoss(base.LossFn):
@@ -175,8 +151,11 @@ class KondoLoss(base.LossFn):
     a_tok = (advantage[:, None]) * token_mask
 
     surprisal_tok = -lp_pol_answer
-    priority_score = _compute_priority(
-        self.priority, advantage, surprisal_tok, token_mask, self.alpha_additive
+    priority_score = common.compute_priority(
+        self.priority,
+        advantage,
+        surprisal_tok,
+        alpha=self.alpha_additive,
     )
 
     k_target = jnp.maximum(
