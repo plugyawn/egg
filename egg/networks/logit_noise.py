@@ -75,6 +75,13 @@ class LogitNoiseNetwork(nn.Module):
     base_logits = self.inner_network.decode_step(x, *args, **kwargs)
     return self._add_noise(base_logits)
 
+  @nn.compact
+  def init_decode_cache(self, x: jax.Array, *args, **kwargs) -> jax.Array:
+    """Initializes the inner network's decode cache without sampling noise."""
+    if not hasattr(self.inner_network, "init_decode_cache"):
+      raise ValueError("Inner network does not support cached decoding.")
+    return self.inner_network.init_decode_cache(x, *args, **kwargs)
+
   def _add_noise(self, base_logits: jax.Array) -> jax.Array:
     """Applies the configured logit noise."""
     if self.sigma == 0.0:

@@ -179,7 +179,7 @@ def delight_signals(
         fwd.row_mask,
     )
   else:
-    advantages = rewards
+    advantages = grouped_advantages(rewards, None, None, fwd.row_mask)
 
   surprisal_tok = -fwd.lp_answer
   delight_tok = advantages[:, None] * surprisal_tok
@@ -232,7 +232,7 @@ def delight_signals_from_sample_logprobs(
         row_mask,
     )
   else:
-    advantages = rewards
+    advantages = grouped_advantages(rewards, None, None, row_mask)
 
   surprisal_tok = -sampler_lp_answer
   delight_tok = advantages[:, None] * surprisal_tok

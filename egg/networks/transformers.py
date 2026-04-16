@@ -99,6 +99,37 @@ class Transformer(nn.Module):
     )
     return output_layer(x)  # (B, 1, V)
 
+  @nn.compact
+  def init_decode_cache(self, tokens: jax.Array, **kwargs) -> jax.Array:
+    """Initializes decode-cache state without consuming a real token."""
+    del kwargs  # Unused.
+
+    if tokens.ndim != 2 or tokens.shape[1] != 1:
+      raise ValueError(
+          "init_decode_cache expects tokens with shape (batch_size, 1)."
+      )
+
+    batch_size = tokens.shape[0]
+    _ = self.variable(
+        "cache",
+        "position",
+        lambda: jnp.array(0, dtype=jnp.int32),
+    )
+    dummy_tokens = jnp.zeros(
+        (batch_size, self.config.sequence_length),
+        dtype=tokens.dtype,
+    )
+    x = _embed_decode(dummy_tokens, self.config, jnp.array(0, dtype=jnp.int32))
+
+    for i in range(self.config.num_layers):
+      x = TransformerBlock(
+          self.config,
+          decode=True,
+          name=f"layer_{i}",
+      )(x, mask=None)
+
+    return jnp.zeros((batch_size, 1, self.config.vocab_size), dtype=x.dtype)
+
 
 class TransformerBlock(nn.Module):
   """Single transformer block: pre-norm attention + feed-forward."""

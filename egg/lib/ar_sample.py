@@ -38,6 +38,33 @@ def _extract_logits(
   return outs
 
 
+class _StepKeys(tp.NamedTuple):
+  next_key: jax.Array
+  sample_key: jax.Array
+  explore_key: jax.Array
+  model_key: jax.Array | None
+
+
+def _split_step_keys(
+    key: jax.Array,
+    *,
+    fixed_model_key: bool,
+    fixed_model_rng: jax.Array | None,
+) -> _StepKeys:
+  """Splits one dense-sampler step worth of RNG state."""
+  key, sample_key, explore_key = jax.random.split(key, 3)
+  if fixed_model_key:
+    model_key = fixed_model_rng
+  else:
+    key, model_key = jax.random.split(key)
+  return _StepKeys(
+      next_key=key,
+      sample_key=sample_key,
+      explore_key=explore_key,
+      model_key=model_key,
+  )
+
+
 @dataclasses.dataclass(frozen=True)
 class ARSampler:
   """Autoregressively sample *a batch* of sequences in parallel."""
@@ -66,6 +93,7 @@ class ARSampler:
         self.use_decode_cache
         and model is not None
         and hasattr(model, "decode_step")
+        and hasattr(model, "init_decode_cache")
     ):
       return self._sample_cached(apply_fn, params, prompts, key, model)
     return self._sample_dense(apply_fn, params, prompts, key)
@@ -97,28 +125,31 @@ class ARSampler:
     init = _Carry(seq=seq, logp=logp, key=key)
 
     def step(t: int, carry: _Carry) -> _Carry:
-      seq, logp, k = carry
-      k, k_sample, k_explore = jax.random.split(k, 3)
+      seq, logp, key = carry
+      step_keys = _split_step_keys(
+          key,
+          fixed_model_key=self.fixed_model_key,
+          fixed_model_rng=k_model,
+      )
 
-      if self.fixed_model_key:
-        current_k_model = k_model
-      else:
-        k, current_k_model = jax.random.split(k)
-
-      outs = apply_fn({"params": params}, seq, rngs={"noise": current_k_model})
+      outs = apply_fn({"params": params}, seq, rngs={"noise": step_keys.model_key})
       logits = _extract_logits(outs)
       logits_t = logits[:, t - 1]  # (B, V)
 
       # Sample from model
-      model_tok = jax.random.categorical(k_sample, logits_t)  # (B,)
+      model_tok = jax.random.categorical(step_keys.sample_key, logits_t)  # (B,)
 
       if self.epsilon > 0:
         # Epsilon-greedy exploration
         explore_action = jax.random.randint(
-            k_explore, shape=(batch_size,), minval=0, maxval=self.vocab_size
+            step_keys.explore_key,
+            shape=(batch_size,),
+            minval=0,
+            maxval=self.vocab_size,
         )
         explore_cond = (
-            jax.random.uniform(k_explore, shape=(batch_size,)) < self.epsilon
+            jax.random.uniform(step_keys.explore_key, shape=(batch_size,))
+            < self.epsilon
         )
         tok = jnp.where(explore_cond, explore_action, model_tok)
       else:
@@ -150,7 +181,7 @@ class ARSampler:
 
       seq = seq.at[:, t].set(tok)
       logp = logp.at[:, t].set(lp_t)
-      return _Carry(seq, logp, k)
+      return _Carry(seq, logp, step_keys.next_key)
 
     final = jax.lax.fori_loop(
         lower=prompt_len,
@@ -192,11 +223,6 @@ class ARSampler:
     else:
       k_model = None
 
-    def next_model_key(k: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-      if self.fixed_model_key:
-        return k, k_model
-      return jax.random.split(k)
-
     def decode_apply(
         cache: dict[str, jax.Array] | None,
         token: jax.Array,
@@ -222,53 +248,75 @@ class ARSampler:
         )
       return _extract_logits(outs), mutated["cache"]
 
+    def init_cache_apply(token: jax.Array) -> dict[str, jax.Array]:
+      _, mutated = apply_fn(
+          {"params": params},
+          token,
+          method=model.init_decode_cache,
+          mutable=["cache"],
+      )
+      return mutated["cache"]
+
     def prompt_token_at(i: int) -> jax.Array:
       return jax.lax.dynamic_slice(prompts, (0, i), (batch_size, 1))
 
-    key, current_k_model = next_model_key(key)
-    logits_prev, cache = decode_apply(None, prompt_token_at(0), current_k_model)
+    first_step_keys = _split_step_keys(
+        key,
+        fixed_model_key=self.fixed_model_key,
+        fixed_model_rng=k_model,
+    )
+    cache = init_cache_apply(prompt_token_at(0))
+    prefill_model_key = first_step_keys.model_key
+    logits_prev, cache = decode_apply(
+        cache,
+        prompt_token_at(0),
+        prefill_model_key,
+    )
 
     def prefill_step(
         i: int,
-        carry: tuple[jax.Array, dict[str, jax.Array], jax.Array],
-    ) -> tuple[jax.Array, dict[str, jax.Array], jax.Array]:
-      k, current_cache, current_logits = carry
-      k, current_k_model = next_model_key(k)
+        carry: tuple[dict[str, jax.Array], jax.Array],
+    ) -> tuple[dict[str, jax.Array], jax.Array]:
+      current_cache, current_logits = carry
       current_logits, current_cache = decode_apply(
           current_cache,
           prompt_token_at(i),
-          current_k_model,
+          prefill_model_key,
       )
-      return k, current_cache, current_logits
+      return current_cache, current_logits
 
-    key, cache, logits_prev = jax.lax.fori_loop(
+    cache, logits_prev = jax.lax.fori_loop(
         1,
         prompt_len,
         prefill_step,
-        (key, cache, logits_prev),
+        (cache, logits_prev),
     )
 
     init = _DecodeCarry(
         seq=seq,
         logp=logp,
-        key=key,
+        key=first_step_keys.next_key,
+        sample_key=first_step_keys.sample_key,
+        explore_key=first_step_keys.explore_key,
         cache=cache,
         logits_prev=logits_prev,
     )
 
     def step(t: int, carry: _DecodeCarry) -> _DecodeCarry:
-      seq, logp, k, cache, logits_prev = carry
-      k, k_sample, k_explore = jax.random.split(k, 3)
+      seq, logp, key, sample_key, explore_key, cache, logits_prev = carry
 
       logits_t = logits_prev[:, 0]  # (B, V)
-      model_tok = jax.random.categorical(k_sample, logits_t)
+      model_tok = jax.random.categorical(sample_key, logits_t)
 
       if self.epsilon > 0:
         explore_action = jax.random.randint(
-            k_explore, shape=(batch_size,), minval=0, maxval=self.vocab_size
+            explore_key,
+            shape=(batch_size,),
+            minval=0,
+            maxval=self.vocab_size,
         )
         explore_cond = (
-            jax.random.uniform(k_explore, shape=(batch_size,)) < self.epsilon
+            jax.random.uniform(explore_key, shape=(batch_size,)) < self.epsilon
         )
         tok = jnp.where(explore_cond, explore_action, model_tok)
       else:
@@ -292,29 +340,47 @@ class ARSampler:
 
       def decode_next(
           state: tuple[jax.Array, dict[str, jax.Array]],
-      ) -> tuple[jax.Array, dict[str, jax.Array], jax.Array]:
-        inner_k, inner_cache = state
-        inner_k, next_k_model = next_model_key(inner_k)
+      ) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array], jax.Array]:
+        inner_key, inner_cache = state
+        next_step_keys = _split_step_keys(
+            inner_key,
+            fixed_model_key=self.fixed_model_key,
+            fixed_model_rng=k_model,
+        )
         next_logits, inner_cache = decode_apply(
             inner_cache,
             tok[:, None],
-            next_k_model,
+            next_step_keys.model_key,
         )
-        return inner_k, inner_cache, next_logits
+        return (
+            next_step_keys.next_key,
+            next_step_keys.sample_key,
+            next_step_keys.explore_key,
+            inner_cache,
+            next_logits,
+        )
 
       def keep_state(
           state: tuple[jax.Array, dict[str, jax.Array]],
-      ) -> tuple[jax.Array, dict[str, jax.Array], jax.Array]:
-        inner_k, inner_cache = state
-        return inner_k, inner_cache, logits_prev
+      ) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array], jax.Array]:
+        inner_key, inner_cache = state
+        return inner_key, sample_key, explore_key, inner_cache, logits_prev
 
-      k, cache, logits_prev = jax.lax.cond(
+      key, sample_key, explore_key, cache, logits_prev = jax.lax.cond(
           t + 1 < self.sequence_length,
           decode_next,
           keep_state,
-          (k, cache),
+          (key, cache),
       )
-      return _DecodeCarry(seq, logp, k, cache, logits_prev)
+      return _DecodeCarry(
+          seq,
+          logp,
+          key,
+          sample_key,
+          explore_key,
+          cache,
+          logits_prev,
+      )
 
     final = jax.lax.fori_loop(
         lower=prompt_len,
@@ -323,7 +389,7 @@ class ARSampler:
         init_val=init,
     )
 
-    tokens, log_probs, _, _, _ = final
+    tokens, log_probs, _, _, _, _, _ = final
     if squeeze:
       tokens, log_probs = tokens[0], log_probs[0]
 
@@ -382,5 +448,7 @@ class _DecodeCarry(tp.NamedTuple):
   seq: jax.Array  # (B, seq_length)
   logp: jax.Array  # (B, seq_length)
   key: jax.Array
+  sample_key: jax.Array
+  explore_key: jax.Array
   cache: dict[str, jax.Array]
   logits_prev: jax.Array  # (B, 1, vocab_size)
