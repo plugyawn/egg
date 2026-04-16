@@ -72,6 +72,30 @@ class KondoAsyncTrainer(base.Trainer):
       return logging.logarithmic_logging(step)
     return step % self.config.log_freq == 0
 
+  def _can_reuse_sampler_logprobs_for_screen(
+      self,
+      actor_cfg: tp.Any,
+  ) -> bool:
+    """Returns True if sampler log-probs exactly match learner log-probs."""
+    if self.config.sampler_delay != 0:
+      return False
+    if self.config.sampler_bits < 32 or not self.config.deterministic:
+      return False
+    if getattr(actor_cfg, "epsilon", 0.0) != 0.0:
+      return False
+    if getattr(actor_cfg, "bug_prob", 0.0) != 0.0:
+      return False
+    if getattr(actor_cfg, "correct_prob", 0.0) != 0.0:
+      return False
+    if getattr(actor_cfg, "random_prob", 0.0) != 0.0:
+      return False
+    if getattr(actor_cfg, "override_token_prob", None) is not None:
+      return False
+    sampler_net_cfg = getattr(actor_cfg, "sampler_network_config", None)
+    if sampler_net_cfg is None:
+      return True
+    return getattr(sampler_net_cfg, "sigma", 0.0) == 0.0
+
   def __call__(
       self,
       actor: base.Actor[base.StateT],
@@ -82,6 +106,9 @@ class KondoAsyncTrainer(base.Trainer):
       raise ValueError("KondoAsyncTrainer expects an actor with a config.")
     batch_size = actor_cfg.prompts_per_batch * actor_cfg.samples_per_prompt
     keep_count = max(1, int(round(self.config.pct_learn * batch_size)))
+    reuse_sampler_logprobs_for_screen = (
+        self._can_reuse_sampler_logprobs_for_screen(actor_cfg)
+    )
 
     quantizer = quantization.QuantizeConfig(
         num_bits=self.config.sampler_bits,
@@ -111,16 +138,25 @@ class KondoAsyncTrainer(base.Trainer):
         batch: base.Batch,
         key: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, base.Metrics]:
-      signals = common.delight_signals(
-          current_state.params,
-          current_state,
-          batch,
-          key,
-          use_grouped_baseline=self.config.use_grouped_baseline,
-          num_groups=self.config.num_groups,
-          priority=self.config.priority,
-          alpha_additive=self.config.alpha_additive,
-      )
+      if reuse_sampler_logprobs_for_screen:
+        signals = common.delight_signals_from_sample_logprobs(
+            batch,
+            use_grouped_baseline=self.config.use_grouped_baseline,
+            num_groups=self.config.num_groups,
+            priority=self.config.priority,
+            alpha_additive=self.config.alpha_additive,
+        )
+      else:
+        signals = common.delight_signals(
+            current_state.params,
+            current_state,
+            batch,
+            key,
+            use_grouped_baseline=self.config.use_grouped_baseline,
+            num_groups=self.config.num_groups,
+            priority=self.config.priority,
+            alpha_additive=self.config.alpha_additive,
+        )
       token_gate, gate_threshold, k_target = common.topk_token_gate(
           signals.priority_tok,
           signals.fwd.token_mask,
@@ -163,6 +199,9 @@ class KondoAsyncTrainer(base.Trainer):
           "tokens_selected": selected_tok_count,
           "tokens_selected_in_kept_rows": kept_selected_tok_count,
           "selected_token_recall": kept_selected_tok_count / selected_tok_count,
+          "used_sampler_logprobs": jnp.asarray(
+              reuse_sampler_logprobs_for_screen, jnp.float32
+          ),
       }
       return keep_idx, signals.advantages, token_gate, metrics
 

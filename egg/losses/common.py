@@ -47,6 +47,15 @@ class DelightSignals:
   priority_row: jax.Array  # (B,)
 
 
+def answer_token_mask(batch: base.Batch) -> tuple[jax.Array, jax.Array]:
+  """Returns row and answer-token masks for a batch."""
+  prompts, answers = batch.prompts, batch.answers
+  row_mask = batch.aux.get("row_mask", jnp.ones(prompts.shape[0], jnp.float32))
+  row_mask = row_mask.astype(jnp.float32)
+  token_mask = (answers >= 0).astype(jnp.float32) * row_mask[:, None]
+  return row_mask, token_mask
+
+
 def forward_pass(
     params: base.Params,
     state: base.StateT,
@@ -68,14 +77,12 @@ def forward_pass(
   start = prompt_len - 1
   end = prompt_len + answer_len - 1
 
-  ans_tok_mask = (answers >= 0).astype(jnp.float32)
-  row_mask = batch.aux.get("row_mask", jnp.ones(prompts.shape[0], jnp.float32))
-  row_mask = row_mask.astype(jnp.float32)
+  row_mask, token_mask = answer_token_mask(batch)
 
   return PolicyLogProbs(
       lp_all=lp_all[:, start:end, :],
       lp_answer=lp_pol[:, start:end],
-      token_mask=ans_tok_mask * row_mask[:, None],
+      token_mask=token_mask,
       row_mask=row_mask,
   )
 
@@ -189,6 +196,66 @@ def delight_signals(
       jnp.sum(priority_tok * fwd.token_mask, axis=1) / safe_tok_count
   ) * fwd.row_mask
 
+  return DelightSignals(
+      fwd=fwd,
+      sampler_lp_answer=sampler_lp_answer,
+      advantages=advantages,
+      surprisal_tok=surprisal_tok,
+      delight_tok=delight_tok,
+      priority_tok=priority_tok,
+      priority_row=priority_row,
+  )
+
+
+def delight_signals_from_sample_logprobs(
+    batch: base.Batch,
+    *,
+    use_grouped_baseline: bool,
+    num_groups: int | None,
+    priority: str = "delight",
+    alpha_additive: float = 0.5,
+) -> DelightSignals:
+  """Computes screening signals directly from stored sampler log-probs.
+
+  This is only exact when the actor policy matches the learner policy.
+  """
+  row_mask, token_mask = answer_token_mask(batch)
+  sampler_lp_answer = sampler_answer_logprobs(batch)
+  rewards = batch.rewards
+
+  if use_grouped_baseline:
+    group_ids = batch.aux.get("group_ids")
+    advantages = grouped_advantages(
+        rewards,
+        group_ids,
+        num_groups,
+        row_mask,
+    )
+  else:
+    advantages = rewards
+
+  surprisal_tok = -sampler_lp_answer
+  delight_tok = advantages[:, None] * surprisal_tok
+  priority_tok = compute_priority(
+      priority,
+      advantages,
+      surprisal_tok,
+      alpha=alpha_additive,
+  )
+
+  tok_count_per_row = jnp.sum(token_mask, axis=1)
+  safe_tok_count = tok_count_per_row + 1e-8
+  priority_row = (
+      jnp.sum(priority_tok * token_mask, axis=1) / safe_tok_count
+  ) * row_mask
+
+  dummy_lp_all = jnp.zeros(surprisal_tok.shape + (1,), dtype=sampler_lp_answer.dtype)
+  fwd = PolicyLogProbs(
+      lp_all=dummy_lp_all,
+      lp_answer=sampler_lp_answer,
+      token_mask=token_mask,
+      row_mask=row_mask,
+  )
   return DelightSignals(
       fwd=fwd,
       sampler_lp_answer=sampler_lp_answer,
