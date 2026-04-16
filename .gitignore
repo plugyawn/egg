@@ -22,3 +22,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Local development environments and test caches
+.venv/
+.pytest_cache/
+
+# Generated experiment outputs
+experiments/kondo/artifacts/
